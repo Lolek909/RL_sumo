@@ -68,7 +68,7 @@ class Junction:
         state = self.get_current_state()
         nagroda = self.check_the_traffic()
         self.state_history.append(state)
-
+        print(len(self.state_history))
         if len(self.state_history) < self.state_history.maxlen:
             return
 
