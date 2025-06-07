@@ -1,7 +1,7 @@
 from cmath import phase
 from collections import deque
 from numpy import dtype
-from dqn_model2 import DQN_RAM, DQN, CriticNet
+from dqn_model import DQN_RAM, DQN, CriticNet
 import numpy as np
 import matplotlib.pyplot as plt
 import traci
@@ -190,4 +190,3 @@ for episode in range(100):
     traci.close()
 
 print("Koniec")
-
