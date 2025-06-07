@@ -1,7 +1,7 @@
 from cmath import phase
 from collections import deque
 from numpy import dtype
-from dqn_model import DQN_RAM, DQN, CriticNet
+from dqn_model import DQN_RAM, DQN_RAM, CriticNet
 import numpy as np
 import matplotlib.pyplot as plt
 import traci
@@ -10,6 +10,7 @@ from torch import nn
 import torch.optim as optim
 import os
 import torch.nn.functional as F
+import random
 
 
 sumo_cfg_="c:/Users/mateu/Sumo/2025-03-25-15-35-18/proste_skrzyz.sumocfg"
@@ -19,140 +20,112 @@ traci.start(sumo_cmd)
 
 traffic_ligts = traci.trafficlight.getIDList()
 
-print(traffic_ligts)
-
 class Junction:
-    # inicjalizacja klasy do kontroli każdego pojedynczego skrzyżowania
-    def __init__(self, junction_id, model=None, critic_net=None):
+    def __init__(self, junction_id):
         self.junction_id = junction_id
-        self.lanes = traci.trafficlight.getControlledLanes(self.junction_id)  # Pobranie ID pasów
+        self.lanes = traci.trafficlight.getControlledLanes(junction_id)
+        self.num_phases = len(traci.trafficlight.getCompleteRedYellowGreenDefinition(junction_id)[0].phases)
         self.current_phase = 0
 
-        program = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.junction_id)
-        self.num_phases = len(program[0].phases)
-        print(f"Skrzyżowanie {self.junction_id}, kontorluje pasy: {self.lanes}")
-        print(f"Skrzyżowanie {self.junction_id}, posiada {self.num_phases} faz")
-        self.state_history = deque(maxlen=20)
-        self.model = model
-        self.critic_net = critic_net
+    def get_state(self):
+        return np.array([traci.lane.getLastStepVehicleNumber(lane) for lane in self.lanes], dtype=np.float32)
 
-    def get_current_state(self):
-        return [traci.lane.getLastStepVehicleNumber(lane) for lane in self.lanes]
+    def apply_action(self, phase_index):
+        traci.trafficlight.setPhase(self.junction_id, phase_index)
+        self.current_phase = phase_index
 
-    def change_phase(self, phase_index):
-        if 0 <= phase_index < self.num_phases:
-            traci.trafficlight.setPhase(self.junction_id, phase_index)
-            self.current_phase = phase_index
-            print(phase_index)
-        else:
-            print("Niepoprawny index")
-
-    def check_the_traffic(self):
-        kara = []
+    def get_reward(self):
+        reward = 0.0
         for lane in self.lanes:
-            vechicle_count = traci.lane.getLastStepVehicleNumber(lane)
-            kara.append(vechicle_count*5) # kara 1
-            vehicles_on_lane = traci.lane.getLastStepVehicleIDs(lane)
-            waiting_time_total = sum(traci.vehicle.getWaitingTime(veh_id)**2 for veh_id in vehicles_on_lane) #kara 2
-            kara.append(waiting_time_total)
-            speeds = sum(-0.3 * traci.vehicle.getSpeed(veh_id) for veh_id in vehicles_on_lane)
-            kara.append(speeds)
+            v = traci.lane.getLastStepVehicleNumber(lane)
+            reward -= v * 5
+            for veh_id in traci.lane.getLastStepVehicleIDs(lane):
+                reward -= traci.vehicle.getWaitingTime(veh_id)**2
+                reward -= 0.3 * traci.vehicle.getSpeed(veh_id)
+        return reward
 
-        kara = sum(kara)
-        nagroda = -kara
+    def get_num_actions(self):
+        return self.num_phases
 
-        print(f"[INIT] {self.junction_id}, nagroda: {nagroda}")
-        return nagroda
+class RLAgent:
+    def __init__(self, state_size, action_size, device="cuda"):
+        self.policy_net = DQN_RAM(in_channels=state_size, num_actions=action_size).to(device)
+        self.target_net = DQN_RAM(in_channels=state_size, num_actions=action_size).to(device)
+        self.critic = CriticNet(in_features=state_size).to(device)
 
-    def step(self, use_rl=False):
-        state = self.get_current_state()
-        nagroda = self.check_the_traffic()
-        self.state_history.append(state)
-        print(len(self.state_history))
-        if len(self.state_history) < self.state_history.maxlen:
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-3)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3)
+
+        self.device = device
+        self.replay_buffer = deque(maxlen=100)
+        self.batch_size = 64
+        self.gamma = 0.99
+        self.epsilon = 0.2
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
+
+    def act(self, state):
+        if np.random.rand() < self.epsilon:
+            return np.random.randint(0, self.policy_net.num_actions)
+        with torch.no_grad():
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            q_values = self.policy_net(state_tensor)
+            return q_values.argmax().item()
+
+    def remember(self, state, action, reward, next_state):
+        self.replay_buffer.append((state, action, reward, next_state))
+
+    def train(self):
+        if len(self.replay_buffer) < self.batch_size:
             return
 
-        if use_rl and self.model is not None:
+        batch = random.sample(self.replay_buffer, self.batch_size)
+        states, actions, rewards, next_states = zip(*batch)
+
+        states = torch.tensor(states, dtype=torch.float32).to(self.device)
+        actions = torch.tensor(actions).unsqueeze(1).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(self.device)
+        next_states = torch.tensor(next_states, dtype=torch.float32).to(self.device)
+
+        # DQN update
+        q_values = self.policy_net(states).gather(1, actions)
+        with torch.no_grad():
+            max_next_q = self.target_net(next_states).max(1, keepdim=True)[0]
+        target_q = rewards + self.gamma * max_next_q
+        loss = F.mse_loss(q_values, target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # Critic update
+        predicted_reward = self.critic(states)
+        critic_loss = F.mse_loss(predicted_reward, rewards)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Epsilon decay
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
 
-            input_tensor = torch.tensor(self.state_history, dtype=torch.float32).flatten().unsqueeze(0) # [1, L*N]
-            input_tensor = input_tensor.to(next(self.model.parameters()).device)
 
-            with torch.no_grad():
-                predicted_reward = self.critic_net(state)
-                q_values = self.model(input_tensor)
-                action = torch.argmax(q_values).item()
+for id in traci.trafficlight.getIDList():
+    junction = Junction(junction_id=id)
+    agent = RLAgent(state_size=len(junction.get_state()), action_size=junction.get_num_actions())
 
-                loss = F.mse_loss(predicted_reward, torch.tensor(nagroda), dtype=torch.float32)
-            self.change_phase(action)
-        else:
-            self.change_phase(self.current_phase)
-
-
-
-
-
-
-    # def print_phase(self):
-    #     phases = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.junction_id)[0].phases
-    #     for i, p in enumerate(phases):
-    #         if i == self.current_phase:
-    #             print(f"Faza {i}: {p.state}")
-    #
-    # def next_phase(self):
-    #     new_phase = (self.current_phase + 1) % self.num_phases
-    #     self.change_phase(new_phase)
-
-
-class TrafficController:
-    def __init__(self):
-        self.junctions = []
-        self._initailize()
-
-    def _initailize(self):
-        lights_ids = traci.trafficlight.getIDList()
-        for id in lights_ids:
-            model = DQN(in_channels=10 * len(traci.trafficlight.getControlledLanes(id)), num_actions=8)
-            model_optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-            critic_net = CriticNet(in_features=len(junction.lanes))
-            critic_optimizer = optim.Adam(critic_net.parameters(), lr=1e-3)
-            try:
-                model.load_state_dict((torch.load("model_skrzyz.pth")))
-            except:
-                pass
-            model = model.cuda()
-            model.eval()
-            critic_net = CriticNet.cuda()
-            critic_net.eval()
-            junction = Junction(id, model=model, critic_net=critic_net)
-            self.junctions.append(junction)
-
-    def step(self):
-        for j in self.junctions:
-            # Przykład sterowania: zmiana fazy co 5 kroków
-            try:
-                j.step(use_rl=True)
-            except:
-                j.step(use_rl=False)
-
-    def log_reward(self):
-        print("rewards for junctions")
-        for j in self.junctions:
-            reward = j.check_the_traffic()
-
-
-controller = TrafficController()
-
-step = 0
-while step < 1000:
+for step in range(10000):
     traci.simulationStep()
 
-    controller.step(step)
+    state = junction.get_state()
+    action = agent.act(state)
+    junction.apply_action(action)
+    reward = junction.get_reward()
+    next_state = junction.get_state()
+
+    agent.remember(state, action, reward, next_state)
+    agent.train()
 
 
 
-    step += 1
-
-
+traci.trafficlight.getIDList()
 
